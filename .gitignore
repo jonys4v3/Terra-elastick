@@ -1,0 +1,26 @@
+# Valores renderizados con secrets — nunca al repo
+/tmp/
+*-rendered.yaml
+*secrets*
+.env
+.env.*
+*.pem
+*.key
+
+# Terraform (si se usa localmente)
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.backup
+**/tfplan
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Helm charts descargados
+charts/
+
+# Logs
+*.log
