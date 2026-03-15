@@ -1,0 +1,231 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# helm/jenkins/values.yaml
+# Valores de producción para el chart oficial jenkins/jenkins en EKS.
+# Instalar con:
+#   helm repo add jenkins https://charts.jenkins.io
+#   helm repo update
+#   helm upgrade --install jenkins jenkins/jenkins \
+#     -n jenkins --create-namespace \
+#     -f helm/jenkins/values.yaml \
+#     --version 5.3.3
+# ─────────────────────────────────────────────────────────────────────────────
+
+controller:
+  image: "jenkins/jenkins"
+  tag: "2.462.3-lts-jdk21"
+  imagePullPolicy: IfNotPresent
+
+  # ── Recursos del controller ─────────────────────────────────────────────
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "2Gi"
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+
+  # ── JVM tuning ──────────────────────────────────────────────────────────
+  javaOpts: >-
+    -Xms1g -Xmx2g
+    -XX:+UseG1GC
+    -XX:+ExplicitGCInvokesConcurrent
+    -Djava.awt.headless=true
+    -Djenkins.install.runSetupWizard=false
+
+  # ── Plugins — lista explícita y versionada ──────────────────────────────
+  installPlugins:
+    - kubernetes:4295.v7fa_01e5158b_e
+    - kubernetes-credentials:0.11
+    - workflow-aggregator:600.vb_57cdd26fdd7
+    - git:5.2.2
+    - github:1.38.0
+    - github-branch-source:1787.v8b_8cd49a_f8f1
+    - pipeline-stage-view:2.34
+    - pipeline-graph-analysis:202.va_d268e64deb_3
+    - blueocean:1.27.14
+    - credentials-binding:681.vf91669a_32e45
+    - aws-credentials:231.v08a_40f4a_e56d
+    - amazon-ecr:1.114.v5d12ddf6a_3d7
+    - configuration-as-code:1836.vccda_4a_122a_a_e
+    - job-dsl:1.87
+    - slack:729.v5c30a_4239aa_d
+    - ansicolor:1.0.4
+    - timestamper:1.26
+    - build-timeout:1.32
+    - authorize-project:1.7.0
+    - matrix-auth:3.2.2
+    - role-strategy:727.vd344b_eec783d
+    - prometheus:773.v03cc9b_1f60f0
+    - notification-api:2.15
+    - lockable-resources:1218.v65b_71ac4a_a_f1
+
+  # ── Configuration as Code ───────────────────────────────────────────────
+  JCasC:
+    defaultConfig: false
+    configScripts:
+      jenkins-casc: |
+        # Cargado desde ConfigMap — ver jenkins/casc/jenkins.yaml
+
+  # ── ServiceAccount con IRSA (IAM Roles for Service Accounts) ───────────
+  serviceAccount:
+    create: true
+    name: jenkins
+    annotations:
+      eks.amazonaws.com/role-arn: "${JENKINS_IAM_ROLE_ARN}"  # rellenar en bootstrap
+
+  # ── Persistencia del controller ─────────────────────────────────────────
+  persistence:
+    enabled: true
+    storageClass: "gp3"
+    size: "50Gi"
+    accessMode: ReadWriteOnce
+
+  # ── Ingress (NGINX + cert-manager TLS) ──────────────────────────────────
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: "letsencrypt-prod"
+      nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    hostName: "jenkins.acme.internal"
+    tls:
+      - secretName: jenkins-tls
+        hosts:
+          - jenkins.acme.internal
+
+  # ── Sondas de salud ─────────────────────────────────────────────────────
+  livenessProbe:
+    httpGet:
+      path: "/login"
+      port: 8080
+    initialDelaySeconds: 120
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 5
+
+  readinessProbe:
+    httpGet:
+      path: "/login"
+      port: 8080
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    timeoutSeconds: 5
+
+  # ── Seguridad del pod ───────────────────────────────────────────────────
+  podSecurityContextOverride:
+    runAsUser: 1000
+    runAsNonRoot: true
+    fsGroup: 1000
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: ["ALL"]
+
+  # ── Tolerations y affinity para nodos dedicados CI ──────────────────────
+  tolerations:
+    - key: "jenkins"
+      operator: "Equal"
+      value: "true"
+      effect: "NoSchedule"
+
+  nodeSelector:
+    role: "jenkins-controller"
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values: ["jenkins-controller"]
+            topologyKey: kubernetes.io/hostname
+
+# ── Agentes dinámicos Kubernetes ─────────────────────────────────────────────
+agent:
+  enabled: true
+  defaultsProviderTemplate: ""
+  namespace: jenkins-agents
+
+  # Imagen base por defecto (sobreescrita por templates específicos)
+  image: "jenkins/inbound-agent"
+  tag: "3256.v88a_f6e922152-1"
+
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  podRetention: "never"        # Eliminar pod al terminar el build
+  idleMinutes: 0               # Sin warm pool en prod (coste)
+  connectTimeout: 120
+
+  # Volumen para cache de Terraform providers
+  volumes:
+    - type: EmptyDir
+      mountPath: /home/jenkins/.terraform.d/plugin-cache
+
+  # ── Pod templates personalizados ────────────────────────────────────────
+  podTemplates:
+
+    # --- Agente Terraform (el más importante) ---
+    terraform:
+      label: "terraform-agent"
+      namespace: jenkins-agents
+      serviceAccount: jenkins-agent-terraform
+      nodeSelector:
+        role: "jenkins-agents"
+      containers:
+        - name: terraform
+          image: "acme/jenkins-terraform-agent:1.7.5"  # imagen custom (ver Dockerfile)
+          command: "sleep"
+          args: "99d"
+          ttyEnabled: true
+          resourceRequestCpu: "500m"
+          resourceRequestMemory: "1Gi"
+          resourceLimitCpu: "2000m"
+          resourceLimitMemory: "2Gi"
+          envVars:
+            - envVar:
+                key: TF_PLUGIN_CACHE_DIR
+                value: /home/jenkins/.terraform.d/plugin-cache
+            - envVar:
+                key: AWS_DEFAULT_REGION
+                value: eu-west-1
+        - name: jnlp
+          image: "jenkins/inbound-agent:3256.v88a_f6e922152-1"
+          resourceRequestCpu: "100m"
+          resourceRequestMemory: "128Mi"
+      volumes:
+        - emptyDirVolume:
+            mountPath: /home/jenkins/.terraform.d/plugin-cache
+            memory: false
+
+    # --- Agente kubectl ---
+    kubectl:
+      label: "kubectl-agent"
+      namespace: jenkins-agents
+      serviceAccount: jenkins-agent-kubectl
+      containers:
+        - name: kubectl
+          image: "bitnami/kubectl:1.29"
+          command: "sleep"
+          args: "99d"
+          ttyEnabled: true
+          resourceRequestCpu: "100m"
+          resourceRequestMemory: "128Mi"
+
+# ── Prometheus metrics ────────────────────────────────────────────────────────
+prometheus:
+  enabled: true
+  serviceMonitorNamespace: monitoring
+  serviceMonitorAdditionalLabels:
+    release: kube-prometheus-stack

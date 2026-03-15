@@ -1,0 +1,173 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// jenkins/pipelines/Jenkinsfile.pr
+// Pipeline para Pull Requests: valida y planifica en todos los entornos.
+// Se lanza automáticamente cuando se abre o actualiza un PR.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Library('acme-shared-lib') _
+
+pipeline {
+
+    agent none   // Cada stage define su propio agente
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+        disableConcurrentBuilds(abortPrevious: true)  // Cancela build anterior del mismo PR
+    }
+
+    environment {
+        GITHUB_TOKEN      = credentials('github-token')
+        TF_IN_AUTOMATION  = 'true'
+        TF_INPUT          = 'false'
+        TF_CLI_ARGS       = '-no-color'
+    }
+
+    stages {
+
+        // ── 1. Validación y linting ──────────────────────────────────────
+        stage('🔍 Validate & Lint') {
+            agent {
+                kubernetes {
+                    label 'terraform-agent'
+                    defaultContainer 'terraform'
+                }
+            }
+            steps {
+                checkout scm
+                script {
+                    terraform.fmt(check: true)
+                    terraform.validate(envs: ['dev', 'staging', 'prod'])
+                    terraform.lint()
+                }
+            }
+            post {
+                failure {
+                    notifications.prComment(
+                        token: env.GITHUB_TOKEN,
+                        message: "❌ **Validate & Lint** falló. Ejecuta `terraform fmt -recursive` y revisa los errores de tflint."
+                    )
+                }
+            }
+        }
+
+        // ── 2. Plan en paralelo para los 3 entornos ──────────────────────
+        stage('📋 Terraform Plan') {
+            parallel {
+
+                stage('Plan · DEV') {
+                    agent {
+                        kubernetes {
+                            label 'terraform-agent'
+                            defaultContainer 'terraform'
+                        }
+                    }
+                    environment {
+                        AWS_CREDENTIALS = credentials('aws-credentials-dev')
+                    }
+                    steps {
+                        checkout scm
+                        script {
+                            def plan = terraform.plan(environment: 'dev')
+                            notifications.prComment(
+                                token: env.GITHUB_TOKEN,
+                                message: notifications.formatPlan(env: 'dev', plan: plan)
+                            )
+                            // Guardar artefacto del plan
+                            stash name: 'tfplan-dev', includes: 'environments/dev/tfplan'
+                        }
+                    }
+                }
+
+                stage('Plan · STAGING') {
+                    agent {
+                        kubernetes {
+                            label 'terraform-agent'
+                            defaultContainer 'terraform'
+                        }
+                    }
+                    environment {
+                        AWS_CREDENTIALS = credentials('aws-credentials-staging')
+                    }
+                    steps {
+                        checkout scm
+                        script {
+                            def plan = terraform.plan(environment: 'staging')
+                            notifications.prComment(
+                                token: env.GITHUB_TOKEN,
+                                message: notifications.formatPlan(env: 'staging', plan: plan)
+                            )
+                            stash name: 'tfplan-staging', includes: 'environments/staging/tfplan'
+                        }
+                    }
+                }
+
+                stage('Plan · PROD') {
+                    agent {
+                        kubernetes {
+                            label 'terraform-agent'
+                            defaultContainer 'terraform'
+                        }
+                    }
+                    environment {
+                        AWS_CREDENTIALS = credentials('aws-credentials-prod')
+                    }
+                    steps {
+                        checkout scm
+                        script {
+                            def plan = terraform.plan(environment: 'prod')
+                            notifications.prComment(
+                                token: env.GITHUB_TOKEN,
+                                message: notifications.formatPlan(env: 'prod', plan: plan)
+                            )
+                            stash name: 'tfplan-prod', includes: 'environments/prod/tfplan'
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 3. Resumen final en el PR ─────────────────────────────────────
+        stage('✅ PR Summary') {
+            agent {
+                kubernetes {
+                    label 'terraform-agent'
+                    defaultContainer 'terraform'
+                }
+            }
+            steps {
+                script {
+                    notifications.prComment(
+                        token: env.GITHUB_TOKEN,
+                        message: """
+## ✅ Terraform Plan completado
+
+| Entorno  | Estado |
+|----------|--------|
+| DEV      | ✅ Plan OK |
+| STAGING  | ✅ Plan OK |
+| PROD     | ✅ Plan OK |
+
+> Revisa los planes individuales en los comentarios anteriores.
+> Una vez aprobado el PR y mergeado a `main`, se ejecutará el apply automáticamente.
+                        """.stripIndent()
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                notifications.slack(
+                    status: currentBuild.result ?: 'SUCCESS',
+                    message: "PR #${env.CHANGE_ID} — Plan ${currentBuild.result ?: 'exitoso'}",
+                    channel: '#ci-cd-alerts'
+                )
+            }
+        }
+    }
+}

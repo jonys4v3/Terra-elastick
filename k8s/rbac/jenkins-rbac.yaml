@@ -1,0 +1,176 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# k8s/rbac/jenkins-rbac.yaml
+# RBAC mínimo necesario para que Jenkins controller y agentes
+# funcionen en EKS con mínimo privilegio.
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+# ── Namespace para el controller ────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+  labels:
+    app.kubernetes.io/managed-by: helm
+    environment: production
+
+---
+# ── Namespace para los agentes efímeros ─────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins-agents
+  labels:
+    app.kubernetes.io/managed-by: helm
+
+---
+# ── ServiceAccount para el controller ───────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: jenkins
+  annotations:
+    # IRSA: el controller asume este rol IAM para leer Secrets Manager
+    eks.amazonaws.com/role-arn: "${JENKINS_CONTROLLER_IAM_ROLE_ARN}"
+
+---
+# ── ClusterRole: permisos mínimos para gestionar pods de agentes ─────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jenkins-agent-manager
+rules:
+  # Gestión de pods (crear/eliminar agentes dinámicos)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
+  # Logs de pods (ver output de builds)
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list", "watch"]
+  # Exec para comandos interactivos en agentes
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Secrets para credenciales de pipelines (solo en namespace jenkins)
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  # ConfigMaps para JCasC
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  # Events para diagnóstico
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+---
+# ── ClusterRoleBinding: controller puede gestionar agentes en jenkins-agents ──
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jenkins-agent-manager-binding
+subjects:
+  - kind: ServiceAccount
+    name: jenkins
+    namespace: jenkins
+roleRef:
+  kind: ClusterRole
+  name: jenkins-agent-manager
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── ServiceAccount para los agentes de Terraform ────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-agent-terraform
+  namespace: jenkins-agents
+  annotations:
+    # IRSA: los agentes de Terraform asumen roles IAM por entorno
+    # (el rol específico se inyecta vía withCredentials en el pipeline)
+    eks.amazonaws.com/role-arn: "${JENKINS_AGENT_IAM_ROLE_ARN}"
+
+---
+# ── ServiceAccount para los agentes de kubectl ──────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-agent-kubectl
+  namespace: jenkins-agents
+
+---
+# ── Role: agentes solo pueden gestionar sus propios pods ────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-agent-self
+  namespace: jenkins-agents
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-agent-self-binding
+  namespace: jenkins-agents
+subjects:
+  - kind: ServiceAccount
+    name: jenkins-agent-terraform
+    namespace: jenkins-agents
+  - kind: ServiceAccount
+    name: jenkins-agent-kubectl
+    namespace: jenkins-agents
+roleRef:
+  kind: Role
+  name: jenkins-agent-self
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# ── NetworkPolicy: agentes solo pueden hablar con el controller ──────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jenkins-agents-network-policy
+  namespace: jenkins-agents
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jenkins
+  egress:
+    # Permitir DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Permitir conexión al controller Jenkins
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: jenkins
+      ports:
+        - port: 50000   # JNLP
+        - port: 8080    # HTTP
+    # Permitir conexión a AWS APIs (HTTPS)
+    - ports:
+        - port: 443
+          protocol: TCP
+    # Permitir conexión a GitHub (HTTPS)
+    - ports:
+        - port: 443
+          protocol: TCP

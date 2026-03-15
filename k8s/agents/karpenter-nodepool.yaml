@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# k8s/agents/karpenter-nodepool.yaml
+# NodePool de Karpenter para escalar nodos EKS automáticamente cuando
+# los agentes Jenkins no caben en los nodos existentes.
+# Karpenter lanza instancias Spot primero → On-Demand como fallback.
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: jenkins-agents
+spec:
+  template:
+    metadata:
+      labels:
+        role: jenkins-agents
+        managed-by: karpenter
+    spec:
+      nodeClassRef:
+        apiVersion: karpenter.k8s.aws/v1beta1
+        kind: EC2NodeClass
+        name: jenkins-agents
+
+      # Solo nodos con este taint — garantiza que solo los agentes Jenkins
+      # aterrizan aquí (evitar mezcla con workloads de negocio)
+      taints:
+        - key: jenkins
+          value: "true"
+          effect: NoSchedule
+
+      requirements:
+        # Arquitectura amd64 (la imagen del agente es x86_64)
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+
+        # Familias de instancia óptimas para CI (compute-optimized)
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["c6i", "c6a", "c5", "m6i", "m6a"]
+
+        # Rango de tamaños (evitar micro/nano que son lentas para Terraform)
+        - key: karpenter.k8s.aws/instance-size
+          operator: In
+          values: ["large", "xlarge", "2xlarge"]
+
+        # Preferir Spot (60-80% más barato), fallback a On-Demand
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+
+        # Usar AZs donde tenemos subnets privadas
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["eu-west-1a", "eu-west-1b", "eu-west-1c"]
+
+      # Expirar nodos tras 24h (renovación de credenciales IMDS, parches)
+      expireAfter: 24h
+
+  # Límites del NodePool completo
+  limits:
+    cpu: 64          # Máximo 64 vCPUs en el pool de agentes
+    memory: 128Gi
+
+  # Consolidar (eliminar nodos vacíos) agresivamente
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 30s    # Si el nodo lleva 30s vacío → terminarlo
+
+---
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: jenkins-agents
+spec:
+  # AMI optimizada para EKS (actualización automática)
+  amiFamily: AL2023
+
+  # Role IAM para los nodos (acceso a ECR, SSM, etc.)
+  role: "acme-eks-node-role"
+
+  # Subnets privadas (por tag)
+  subnetSelectorTerms:
+    - tags:
+        Tier: private
+        Environment: prod
+
+  # Security groups del cluster
+  securityGroupSelectorTerms:
+    - tags:
+        aws:eks:cluster-name: acme-eks-prod
+
+  # Disco root (SSD, suficiente para layers de Docker y Terraform cache)
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+
+  # User data: instalar herramientas extra en el nodo si fuera necesario
+  userData: |
+    #!/bin/bash
+    # Aumentar límite de inotify para builds intensivos
+    echo "fs.inotify.max_user_watches=524288" >> /etc/sysctl.conf
+    sysctl -p
+
+  # Tags propagados a las instancias EC2
+  tags:
+    ManagedBy: karpenter
+    Role: jenkins-agents
+    Company: acme

@@ -1,0 +1,272 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// jenkins/pipelines/Jenkinsfile.prod
+// Pipeline de APPLY para producción.
+// Se ejecuta tras merge a main. Requiere aprobaciones manuales antes de
+// avanzar a staging y prod. Usa lockableResources para evitar applies
+// simultáneos al mismo entorno.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Library('acme-shared-lib') _
+
+pipeline {
+
+    agent none
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 120, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        GITHUB_TOKEN = credentials('github-token')
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT         = 'false'
+        TF_CLI_ARGS      = '-no-color'
+    }
+
+    stages {
+
+        // ── 1. Apply DEV (automático, sin aprobación) ────────────────────
+        stage('🚀 Apply · DEV') {
+            agent {
+                kubernetes {
+                    label 'terraform-agent'
+                    defaultContainer 'terraform'
+                }
+            }
+            environment {
+                AWS_CREDENTIALS = credentials('aws-credentials-dev')
+            }
+            options {
+                lock(resource: 'terraform-lock-dev', inversePrecedence: true)
+            }
+            steps {
+                checkout scm
+                script {
+                    terraform.init(environment: 'dev')
+                    terraform.apply(environment: 'dev', autoApprove: true)
+                }
+            }
+            post {
+                success {
+                    notifications.slack(
+                        status: 'SUCCESS',
+                        message: "✅ Apply DEV completado — build #${BUILD_NUMBER}",
+                        channel: '#ci-cd-alerts'
+                    )
+                }
+                failure {
+                    notifications.slack(
+                        status: 'FAILURE',
+                        message: "❌ Apply DEV FALLIDO — build #${BUILD_NUMBER} — acción inmediata requerida",
+                        channel: '#ci-cd-alerts'
+                    )
+                    error("Apply DEV falló. Abortando pipeline.")
+                }
+            }
+        }
+
+        // ── 2. Gate: aprobación manual para STAGING ──────────────────────
+        stage('🔐 Gate · STAGING') {
+            steps {
+                script {
+                    notifications.slack(
+                        status: 'WAITING',
+                        message: "⏳ Esperando aprobación para apply en STAGING — build #${BUILD_NUMBER}\nAprueba en: ${BUILD_URL}input",
+                        channel: '#ci-cd-alerts'
+                    )
+                }
+                timeout(time: 24, unit: 'HOURS') {
+                    input(
+                        message: "¿Aprobar deploy en STAGING?",
+                        ok: "✅ Aprobar STAGING",
+                        submitterParameter: 'APPROVER',
+                        parameters: [
+                            text(name: 'APPROVAL_REASON', defaultValue: '', description: 'Motivo (opcional)')
+                        ]
+                    )
+                }
+                script {
+                    echo "✅ STAGING aprobado por: ${env.APPROVER}"
+                    audit.log(
+                        action: 'APPROVED',
+                        environment: 'staging',
+                        approver: env.APPROVER,
+                        build: BUILD_NUMBER
+                    )
+                }
+            }
+        }
+
+        // ── 3. Apply STAGING ─────────────────────────────────────────────
+        stage('🚀 Apply · STAGING') {
+            agent {
+                kubernetes {
+                    label 'terraform-agent'
+                    defaultContainer 'terraform'
+                }
+            }
+            environment {
+                AWS_CREDENTIALS = credentials('aws-credentials-staging')
+            }
+            options {
+                lock(resource: 'terraform-lock-staging', inversePrecedence: true)
+            }
+            steps {
+                checkout scm
+                script {
+                    terraform.init(environment: 'staging')
+                    terraform.apply(environment: 'staging', autoApprove: true)
+                }
+            }
+            post {
+                success {
+                    notifications.slack(
+                        status: 'SUCCESS',
+                        message: "✅ Apply STAGING completado — build #${BUILD_NUMBER}",
+                        channel: '#ci-cd-alerts'
+                    )
+                }
+                failure {
+                    notifications.slack(
+                        status: 'FAILURE',
+                        message: "❌ Apply STAGING FALLIDO — build #${BUILD_NUMBER}",
+                        channel: '#ci-cd-alerts'
+                    )
+                    error("Apply STAGING falló. Abortando pipeline.")
+                }
+            }
+        }
+
+        // ── 4. Gate: aprobación manual para PROD ─────────────────────────
+        stage('🔐 Gate · PROD') {
+            steps {
+                script {
+                    // Generar resumen de cambios antes de pedir aprobación
+                    def changes = git.getChangesSummary()
+                    notifications.slack(
+                        status: 'WAITING',
+                        message: """⚠️ *Aprobación requerida para PROD* — build #${BUILD_NUMBER}
+Cambios: ${changes}
+Aprueba en: ${BUILD_URL}input
+*Requiere 2 aprobadores del equipo SRE*""",
+                        channel: '#ci-cd-prod-approvals'
+                    )
+                }
+                timeout(time: 48, unit: 'HOURS') {
+                    input(
+                        message: "¿Aprobar deploy en PRODUCCIÓN? Esta acción es irreversible.",
+                        ok: "🚀 Aprobar PRODUCCIÓN",
+                        submitterParameter: 'APPROVER',
+                        parameters: [
+                            text(name: 'APPROVAL_REASON', defaultValue: '', description: 'Motivo / Ticket JIRA'),
+                            booleanParam(name: 'CONFIRM', defaultValue: false, description: 'Confirmo que he revisado el plan de Terraform')
+                        ]
+                    )
+                }
+                script {
+                    if (!params.CONFIRM) {
+                        error("Debes marcar la casilla de confirmación para continuar.")
+                    }
+                    echo "✅ PROD aprobado por: ${env.APPROVER} — Motivo: ${params.APPROVAL_REASON}"
+                    audit.log(
+                        action: 'APPROVED',
+                        environment: 'prod',
+                        approver: env.APPROVER,
+                        reason: params.APPROVAL_REASON,
+                        build: BUILD_NUMBER
+                    )
+                }
+            }
+        }
+
+        // ── 5. Apply PROD ─────────────────────────────────────────────────
+        stage('🚀 Apply · PROD') {
+            agent {
+                kubernetes {
+                    label 'terraform-agent'
+                    defaultContainer 'terraform'
+                }
+            }
+            environment {
+                AWS_CREDENTIALS = credentials('aws-credentials-prod')
+            }
+            options {
+                lock(resource: 'terraform-lock-prod', inversePrecedence: true)
+            }
+            steps {
+                checkout scm
+                script {
+                    terraform.init(environment: 'prod')
+                    terraform.apply(environment: 'prod', autoApprove: true)
+                }
+            }
+            post {
+                success {
+                    script {
+                        def outputs = terraform.outputs(environment: 'prod')
+                        notifications.slack(
+                            status: 'SUCCESS',
+                            message: """🎉 *Deploy PROD completado* — build #${BUILD_NUMBER}
+Aprobado por: ${env.APPROVER}
+Endpoints creados: ${outputs}""",
+                            channel: '#ci-cd-prod-approvals'
+                        )
+                    }
+                }
+                failure {
+                    notifications.slack(
+                        status: 'FAILURE',
+                        message: "🔴 *Apply PROD FALLIDO* — build #${BUILD_NUMBER} — INCIDENTE ABIERTO AUTOMÁTICAMENTE",
+                        channel: '#ci-cd-prod-approvals'
+                    )
+                    // Abrir incidente automáticamente si falla en prod
+                    script {
+                        pagerduty.triggerAlert(
+                            summary: "Terraform apply PROD falló — build #${BUILD_NUMBER}",
+                            severity: 'critical',
+                            buildUrl: BUILD_URL
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── 6. Smoke test post-deploy ─────────────────────────────────────
+        stage('🧪 Smoke Tests · PROD') {
+            agent {
+                kubernetes {
+                    label 'terraform-agent'
+                    defaultContainer 'terraform'
+                }
+            }
+            environment {
+                AWS_CREDENTIALS = credentials('aws-credentials-prod')
+            }
+            steps {
+                checkout scm
+                script {
+                    smokeTests.runElasticsearch(
+                        environment: 'prod',
+                        checks: ['cluster_health', 'index_create', 'endpoint_reachable']
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                audit.saveToS3(
+                    bucket: 'acme-jenkins-audit-logs',
+                    buildNumber: BUILD_NUMBER,
+                    result: currentBuild.result
+                )
+            }
+        }
+    }
+}

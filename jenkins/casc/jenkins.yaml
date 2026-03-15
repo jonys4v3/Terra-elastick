@@ -1,0 +1,237 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# jenkins/casc/jenkins.yaml
+# Jenkins Configuration as Code completo.
+# Se aplica automáticamente al arrancar el controller.
+# Variables ${VAR} se resuelven desde Kubernetes Secrets o variables de entorno.
+# ─────────────────────────────────────────────────────────────────────────────
+
+jenkins:
+  systemMessage: |
+    ╔═══════════════════════════════════════════════════╗
+    ║  ACME · Jenkins CI/CD · Elasticsearch Platform   ║
+    ║  Gestionado por Configuration as Code — NO editar║
+    ║  manualmente. Abre PR en github.com/acme/jenkins  ║
+    ╚═══════════════════════════════════════════════════╝
+
+  numExecutors: 0           # Controller NO ejecuta builds (solo orquesta)
+  mode: EXCLUSIVE
+  labelString: "controller"
+
+  # ── Seguridad: matriz de permisos por roles ──────────────────────────────
+  authorizationStrategy:
+    roleBased:
+      roles:
+        global:
+          - name: "admin"
+            description: "Administradores Jenkins"
+            permissions:
+              - "Overall/Administer"
+            assignments:
+              - "jenkins-admins"    # Grupo LDAP/SSO
+
+          - name: "developer"
+            description: "Developers: ver y lanzar builds"
+            permissions:
+              - "Overall/Read"
+              - "Job/Build"
+              - "Job/Cancel"
+              - "Job/Read"
+              - "Job/Workspace"
+              - "View/Read"
+              - "Run/Replay"
+            assignments:
+              - "developers"
+
+          - name: "readonly"
+            description: "Solo lectura (auditoría)"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+              - "View/Read"
+            assignments:
+              - "authenticated"
+
+  # ── Autenticación OIDC (GitHub/Okta/etc.) ───────────────────────────────
+  securityRealm:
+    oic:
+      clientId: "${OIDC_CLIENT_ID}"
+      clientSecret: "${OIDC_CLIENT_SECRET}"
+      wellKnownOpenIDConfigurationUrl: "${OIDC_WELL_KNOWN_URL}"
+      userNameField: "email"
+      fullNameFieldName: "name"
+      groupsFieldName: "groups"
+      scopes: "openid email profile groups"
+      logoutFromOpenidProvider: true
+
+  # ── Configuración global ─────────────────────────────────────────────────
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: AWS_DEFAULT_REGION
+            value: eu-west-1
+          - key: TF_IN_AUTOMATION
+            value: "true"
+          - key: TF_INPUT
+            value: "false"
+          - key: COMPANY
+            value: acme
+
+  # ── Semáforos (evitar applies simultáneos al mismo entorno) ─────────────
+  lockableResources:
+    - name: "terraform-lock-dev"
+      description: "Terraform apply mutex — entorno DEV"
+      labels: "terraform-dev"
+    - name: "terraform-lock-staging"
+      description: "Terraform apply mutex — entorno STAGING"
+      labels: "terraform-staging"
+    - name: "terraform-lock-prod"
+      description: "Terraform apply mutex — entorno PROD"
+      labels: "terraform-prod"
+
+# ── Credenciales gestionadas desde AWS Secrets Manager ──────────────────────
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          # Token GitHub para webhooks y comentarios en PRs
+          - string:
+              id: "github-token"
+              description: "GitHub Personal Access Token"
+              secret: "${GITHUB_TOKEN}"
+              scope: GLOBAL
+
+          # Slack webhook para notificaciones
+          - string:
+              id: "slack-webhook-url"
+              description: "Slack Incoming Webhook URL"
+              secret: "${SLACK_WEBHOOK_URL}"
+              scope: GLOBAL
+
+          # AWS credentials para Terraform (usadas en agentes sin IRSA)
+          - aws:
+              id: "aws-credentials-dev"
+              description: "AWS Credentials — DEV"
+              accessKey: "${AWS_ACCESS_KEY_DEV}"
+              secretKey: "${AWS_SECRET_KEY_DEV}"
+              scope: GLOBAL
+
+          - aws:
+              id: "aws-credentials-staging"
+              description: "AWS Credentials — STAGING"
+              accessKey: "${AWS_ACCESS_KEY_STAGING}"
+              secretKey: "${AWS_SECRET_KEY_STAGING}"
+              scope: GLOBAL
+
+          - aws:
+              id: "aws-credentials-prod"
+              description: "AWS Credentials — PROD"
+              accessKey: "${AWS_ACCESS_KEY_PROD}"
+              secretKey: "${AWS_SECRET_KEY_PROD}"
+              scope: GLOBAL
+
+          # SSH key para clonar repos internos
+          - basicSSHUserPrivateKey:
+              id: "github-ssh-key"
+              description: "GitHub SSH Deploy Key"
+              username: "git"
+              privateKeySource:
+                directEntry:
+                  privateKey: "${GITHUB_SSH_PRIVATE_KEY}"
+              scope: GLOBAL
+
+# ── Plugins globales ─────────────────────────────────────────────────────────
+unclassified:
+  # Slack
+  slackNotifier:
+    teamDomain: "acme-workspace"
+    tokenCredentialId: "slack-webhook-url"
+    room: "#ci-cd-alerts"
+
+  # Timestamp en todos los logs
+  timestamper:
+    allPipelines: true
+
+  # GitHub conexión
+  githubPluginConfig:
+    configs:
+      - name: "GitHub"
+        apiUrl: "https://api.github.com"
+        credentialsId: "github-token"
+        manageHooks: true
+
+  # Color ANSI en consola
+  ansiColorBuildWrapper:
+    globalColorMapName: "xterm"
+
+  # Timeouts globales por defecto
+  buildTimeoutWrapper:
+    defaultTimeout: 60   # minutos
+
+  # Location para notificaciones
+  location:
+    url: "https://jenkins.acme.internal/"
+    adminAddress: "devops@acme.com"
+
+# ── Pipeline shared library global ──────────────────────────────────────────
+  globalLibraries:
+    libraries:
+      - name: "acme-shared-lib"
+        retriever:
+          modernSCM:
+            scm:
+              git:
+                remote: "git@github.com:acme/jenkins-shared-lib.git"
+                credentialsId: "github-ssh-key"
+        defaultVersion: "main"
+        implicit: true        # @Library automática en todos los pipelines
+        allowVersionOverride: true
+
+# ── Job DSL — auto-seed de pipelines ────────────────────────────────────────
+jobs:
+  - script: |
+      // Seed job: crea automáticamente un pipeline por cada entorno
+      ['dev', 'staging', 'prod'].each { env ->
+        pipelineJob("elasticsearch-${env}") {
+          description("Pipeline Terraform para Elasticsearch — ${env.toUpperCase()}")
+          definition {
+            cpsScm {
+              scm {
+                git {
+                  remote {
+                    url('git@github.com:acme/terraform-elasticsearch.git')
+                    credentials('github-ssh-key')
+                  }
+                  branch('*/main')
+                }
+              }
+              scriptPath("jenkins/pipelines/Jenkinsfile.${env}")
+            }
+          }
+          triggers {
+            githubPush()
+          }
+        }
+      }
+
+      // Pipeline de nueva app (autoescalado)
+      pipelineJob("elasticsearch-new-app") {
+        description("Registra una nueva app y crea su dominio ES en todos los entornos")
+        parameters {
+          stringParam('APP_NAME', '', 'Nombre de la nueva aplicación (lowercase, max 20 chars)')
+          choiceParam('TARGET_ENV', ['dev', 'staging', 'prod', 'all'], 'Entorno de despliegue')
+        }
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('git@github.com:acme/terraform-elasticsearch.git')
+                  credentials('github-ssh-key')
+                }
+                branch('*/main')
+              }
+            }
+            scriptPath("jenkins/pipelines/Jenkinsfile.new-app")
+          }
+        }
+      }

@@ -1,0 +1,40 @@
+// jenkins/pipelines/Jenkinsfile.staging
+@Library('acme-shared-lib') _
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'terraform-agent'
+            defaultContainer 'terraform'
+        }
+    }
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 45, unit: 'MINUTES')
+        lock(resource: 'terraform-lock-staging')
+    }
+    environment {
+        AWS_CREDENTIALS  = credentials('aws-credentials-staging')
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT         = 'false'
+    }
+    stages {
+        stage('Init')  { steps { script { terraform.init(environment: 'staging') } } }
+        stage('Plan')  { steps { script { terraform.plan(environment: 'staging') } } }
+        stage('Gate')  {
+            steps {
+                timeout(time: 24, unit: 'HOURS') {
+                    input message: '¿Aprobar deploy en STAGING?', ok: '✅ Aprobar', submitterParameter: 'APPROVER'
+                }
+            }
+        }
+        stage('Apply') { steps { script { terraform.apply(environment: 'staging', autoApprove: true) } } }
+        stage('Smoke') { steps { script { smokeTests.runElasticsearch(environment: 'staging', checks: ['endpoint_reachable', 'cluster_health']) } } }
+    }
+    post {
+        always {
+            notifications.slack(status: currentBuild.result ?: 'SUCCESS', message: "Deploy STAGING — build #${BUILD_NUMBER}", channel: '#ci-cd-alerts')
+        }
+    }
+}

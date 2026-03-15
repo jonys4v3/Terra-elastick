@@ -1,0 +1,221 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// jenkins/pipelines/Jenkinsfile.new-app
+// Pipeline de autoescalado: registra una nueva app y despliega su dominio ES.
+// Se lanza manualmente desde Jenkins o vía API con APP_NAME como parámetro.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Library('acme-shared-lib') _
+
+pipeline {
+
+    agent {
+        kubernetes {
+            label 'terraform-agent'
+            defaultContainer 'terraform'
+        }
+    }
+
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '100'))
+    }
+
+    parameters {
+        string(
+            name: 'APP_NAME',
+            defaultValue: '',
+            description: 'Nombre de la nueva app (lowercase, alfanumérico, max 20 chars)'
+        )
+        choice(
+            name: 'TARGET_ENV',
+            choices: ['dev', 'staging', 'prod', 'all'],
+            description: 'Entorno(s) donde desplegar el dominio ES'
+        )
+        string(
+            name: 'INSTANCE_TYPE',
+            defaultValue: 'r6g.large.search',
+            description: 'Tipo de instancia ES para prod'
+        )
+        string(
+            name: 'INSTANCE_COUNT',
+            defaultValue: '3',
+            description: 'Número de nodos de datos'
+        )
+        string(
+            name: 'EBS_VOLUME_SIZE',
+            defaultValue: '100',
+            description: 'Tamaño del volumen EBS en GB por nodo'
+        )
+        string(
+            name: 'ALERT_EMAILS',
+            defaultValue: '',
+            description: 'Emails de alerta separados por coma (ej: team@acme.com,oncall@acme.com)'
+        )
+        string(
+            name: 'JIRA_TICKET',
+            defaultValue: '',
+            description: 'Ticket JIRA asociado (para trazabilidad)'
+        )
+    }
+
+    environment {
+        GITHUB_TOKEN = credentials('github-token')
+        GIT_SSH_KEY  = credentials('github-ssh-key')
+    }
+
+    stages {
+
+        // ── 1. Validar parámetros ────────────────────────────────────────
+        stage('✅ Validar parámetros') {
+            steps {
+                script {
+                    if (!params.APP_NAME?.trim()) {
+                        error("APP_NAME es obligatorio")
+                    }
+                    if (!params.APP_NAME.matches('^[a-z][a-z0-9-]{1,19}$')) {
+                        error("APP_NAME inválido: '${params.APP_NAME}'. Debe ser lowercase, alfanumérico con guiones, máx 20 chars.")
+                    }
+                    echo "✅ Parámetros válidos:"
+                    echo "   APP_NAME     : ${params.APP_NAME}"
+                    echo "   TARGET_ENV   : ${params.TARGET_ENV}"
+                    echo "   INSTANCE_TYPE: ${params.INSTANCE_TYPE}"
+                    echo "   JIRA_TICKET  : ${params.JIRA_TICKET ?: 'N/A'}"
+                }
+            }
+        }
+
+        // ── 2. Crear rama y scaffolding ──────────────────────────────────
+        stage('🌿 Crear rama Git') {
+            steps {
+                checkout scm
+                script {
+                    def branchName = "feat/add-app-${params.APP_NAME}"
+
+                    sh """
+                        git config user.email "jenkins@acme.com"
+                        git config user.name "Jenkins CI"
+                        git checkout -b ${branchName}
+                    """
+
+                    // Scaffolding de la nueva app
+                    sh "bash scripts/new-app.sh ${params.APP_NAME}"
+
+                    // Inyectar configuración en los environments
+                    def envTargets = params.TARGET_ENV == 'all'
+                        ? ['dev', 'staging', 'prod']
+                        : [params.TARGET_ENV]
+
+                    envTargets.each { env ->
+                        appRegistration.injectIntoEnv(
+                            appName: params.APP_NAME,
+                            environment: env,
+                            instanceType: env == 'prod' ? params.INSTANCE_TYPE : 't3.medium.search',
+                            instanceCount: env == 'prod' ? params.INSTANCE_COUNT.toInteger() : 1,
+                            ebsVolumeSize: params.EBS_VOLUME_SIZE.toInteger(),
+                            alertEmails: params.ALERT_EMAILS.split(',').collect { it.trim() }
+                        )
+                    }
+
+                    // Commit y push
+                    sh """
+                        git add -A
+                        git commit -m "feat(es): add new app '${params.APP_NAME}' [${params.JIRA_TICKET ?: 'NO-TICKET'}]
+
+Autoregistered by Jenkins pipeline #${BUILD_NUMBER}
+Instance type: ${params.INSTANCE_TYPE}
+Instance count: ${params.INSTANCE_COUNT}
+Target envs: ${params.TARGET_ENV}"
+
+                        git push origin ${branchName}
+                    """
+
+                    env.BRANCH_NAME_CREATED = branchName
+                }
+            }
+        }
+
+        // ── 3. Plan Terraform en entorno(s) objetivo ─────────────────────
+        stage('📋 Terraform Plan') {
+            steps {
+                script {
+                    def envTargets = params.TARGET_ENV == 'all'
+                        ? ['dev', 'staging', 'prod']
+                        : [params.TARGET_ENV]
+
+                    envTargets.each { targetEnv ->
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                          credentialsId: "aws-credentials-${targetEnv}"]]) {
+                            terraform.init(environment: targetEnv)
+                            terraform.plan(environment: targetEnv)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Abrir PR automáticamente ──────────────────────────────────
+        stage('🔀 Abrir Pull Request') {
+            steps {
+                script {
+                    def prUrl = github.createPullRequest(
+                        token: env.GITHUB_TOKEN,
+                        branch: env.BRANCH_NAME_CREATED,
+                        base: 'main',
+                        title: "feat(es): nueva app '${params.APP_NAME}' [${params.JIRA_TICKET ?: 'AUTO'}]",
+                        body: """
+## Nueva App Elasticsearch: `${params.APP_NAME}`
+
+| Campo            | Valor |
+|-----------------|-------|
+| App Name        | `${params.APP_NAME}` |
+| Entorno(s)      | `${params.TARGET_ENV}` |
+| Instance Type   | `${params.INSTANCE_TYPE}` |
+| Instance Count  | `${params.INSTANCE_COUNT}` |
+| EBS Volume (GB) | `${params.EBS_VOLUME_SIZE}` |
+| JIRA Ticket     | ${params.JIRA_TICKET ?: 'N/A'} |
+| Jenkins Build   | [#${BUILD_NUMBER}](${BUILD_URL}) |
+
+### Recursos que se crearán
+- `aws_opensearch_domain` → `acme-${params.APP_NAME}-<env>-es`
+- `aws_kms_key` (cifrado en reposo)
+- `aws_security_group`
+- `aws_iam_role` + `aws_iam_policy`
+- CloudWatch Alarms (6) + SNS + Dashboard
+
+### Terraform Plan
+El plan se ha ejecutado correctamente y está adjunto en los checks de CI.
+
+> ⚠️ Tras el merge, el apply se ejecutará automáticamente en DEV y requerirá
+> aprobación manual para STAGING y PROD.
+                        """.stripIndent(),
+                        reviewers: ['sre-team', 'infra-team'],
+                        labels: ['terraform', 'elasticsearch', 'auto-generated']
+                    )
+
+                    echo "✅ PR creado: ${prUrl}"
+
+                    notifications.slack(
+                        status: 'SUCCESS',
+                        message: """🆕 *Nueva app ES registrada: `${params.APP_NAME}`*
+PR listo para revisión: ${prUrl}
+Solicitado por: ${currentBuild.getBuildCauses()[0]?.userId ?: 'automatico'}
+JIRA: ${params.JIRA_TICKET ?: 'N/A'}""",
+                        channel: '#ci-cd-alerts'
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            notifications.slack(
+                status: 'FAILURE',
+                message: "❌ Pipeline new-app falló para '${params.APP_NAME}' — build #${BUILD_NUMBER}",
+                channel: '#ci-cd-alerts'
+            )
+        }
+    }
+}

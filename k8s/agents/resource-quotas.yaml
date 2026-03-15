@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# k8s/agents/resource-quotas.yaml
+# ResourceQuota y LimitRange para el namespace jenkins-agents.
+# Evita que builds descontrolados consuman todos los recursos del cluster.
+# ─────────────────────────────────────────────────────────────────────────────
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: jenkins-agents-quota
+  namespace: jenkins-agents
+spec:
+  hard:
+    # Máximo de pods de agentes simultáneos
+    pods: "20"
+    # CPU total máxima en el namespace
+    requests.cpu: "16"
+    limits.cpu: "40"
+    # Memoria total máxima
+    requests.memory: "20Gi"
+    limits.memory: "40Gi"
+    # Limitar PVCs temporales
+    persistentvolumeclaims: "10"
+    requests.storage: "100Gi"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: jenkins-agents-limits
+  namespace: jenkins-agents
+spec:
+  limits:
+    # Límites por defecto para contenedores sin spec explícita
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      defaultRequest:
+        cpu: "100m"
+        memory: "256Mi"
+      max:
+        cpu: "4"
+        memory: "8Gi"
+      min:
+        cpu: "50m"
+        memory: "64Mi"
+    # Límites por Pod completo
+    - type: Pod
+      max:
+        cpu: "8"
+        memory: "16Gi"
+
+---
+# PodDisruptionBudget para el controller Jenkins
+# (permite upgrades del cluster sin matar Jenkins)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: jenkins-controller-pdb
+  namespace: jenkins
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: jenkins-controller
+
+---
+# PriorityClass para que los agentes no bloqueen workloads críticos
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jenkins-agent-priority
+value: 100         # Bajo — los agentes ceden recursos ante workloads de negocio
+globalDefault: false
+description: "Prioridad para pods efímeros de Jenkins CI"

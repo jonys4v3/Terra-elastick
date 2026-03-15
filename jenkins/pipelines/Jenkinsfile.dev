@@ -1,0 +1,33 @@
+// jenkins/pipelines/Jenkinsfile.dev
+@Library('acme-shared-lib') _
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'terraform-agent'
+            defaultContainer 'terraform'
+        }
+    }
+    options {
+        ansiColor('xterm')
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        lock(resource: 'terraform-lock-dev')
+    }
+    environment {
+        AWS_CREDENTIALS  = credentials('aws-credentials-dev')
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT         = 'false'
+    }
+    stages {
+        stage('Init')  { steps { script { terraform.init(environment: 'dev') } } }
+        stage('Plan')  { steps { script { terraform.plan(environment: 'dev') } } }
+        stage('Apply') { steps { script { terraform.apply(environment: 'dev', autoApprove: true) } } }
+        stage('Smoke') { steps { script { smokeTests.runElasticsearch(environment: 'dev', checks: ['endpoint_reachable']) } } }
+    }
+    post {
+        always {
+            notifications.slack(status: currentBuild.result ?: 'SUCCESS', message: "Deploy DEV — build #${BUILD_NUMBER}", channel: '#ci-cd-alerts')
+        }
+    }
+}
